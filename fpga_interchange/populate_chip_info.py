@@ -1867,7 +1867,7 @@ def populate_chip_info(device, constids, device_config):
             device.device_resource_capnp.tileTypeList):
         flattened_tile_type = FlattenedTileType(
             device, tile_type_index, tile_type, cell_bel_mapper, constraints,
-            lut_elements, disabled_routethrus, disabled_site_pips)
+            lut_elements, disabled_routethrus)
 
         tile_type_info = flattened_tile_type.create_tile_type_info(
             cell_bel_mapper)
