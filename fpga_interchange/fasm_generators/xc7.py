@@ -24,6 +24,7 @@ Such special cases may include:
 
 """
 import re
+import sys
 from collections import namedtuple
 from enum import Enum
 from itertools import product
@@ -89,6 +90,59 @@ def parse_lut_bel(lut_bel):
 
 
 class XC7FasmGenerator(FasmGenerator):
+    @staticmethod
+    def get_slice_prefix(site_name, tile_type):
+        """
+        Returns the slice prefix corresponding to the input site name.
+        """
+
+        slice_sites = {
+            "CLBLL_L": ["SLICEL_X0", "SLICEL_X1"],
+            "CLBLL_R": ["SLICEL_X0", "SLICEL_X1"],
+            "CLBLM_L": ["SLICEM_X0", "SLICEL_X1"],
+            "CLBLM_R": ["SLICEM_X0", "SLICEL_X1"],
+        }
+
+        slice_re = re.compile("SLICE_X([0-9]+)Y[0-9]+")
+        m = slice_re.match(site_name)
+        assert m, site_name
+
+        slice_site_idx = int(m.group(1)) % 2
+        return slice_sites[tile_type][slice_site_idx]
+
+    @staticmethod
+    def get_bram_prefix(site_name, tile_type):
+        """
+        Returns the slice prefix corresponding to the input site name.
+        """
+
+        ramb_re = re.compile("RAMB18_X[0-9]+Y([0-9]+)")
+        m = ramb_re.match(site_name)
+        assert m, site_name
+
+        ramb_site_idx = int(m.group(1)) % 2
+        return "RAMB18_Y{}".format(ramb_site_idx)
+
+    @staticmethod
+    def get_iologic_prefix(site_name, tile_type):
+        """
+        Returns the slice prefix corresponding to the input site name.
+        """
+
+        iologic_re = re.compile("([IO](LOGIC|DELAY))_X[0-9]+Y([0-9]+)")
+        m = iologic_re.match(site_name)
+        assert m, site_name
+
+        y_coord = int(m.group(3))
+        if "SING" in tile_type and y_coord % 50 == 0:
+            io_site_idx = 0
+        elif "SING" in tile_type and y_coord % 50 == 49:
+            io_site_idx = 1
+        else:
+            io_site_idx = y_coord % 2
+
+        return "{}_Y{}".format(m.group(1), io_site_idx)
+
     def handle_brams(self):
         """
         Handles slice RAMB18 FASM feature emission.
@@ -280,38 +334,55 @@ class XC7FasmGenerator(FasmGenerator):
             if iostandard.startswith("DIFF_") and is_output:
                 self.add_cell_feature((tile_name, "OUT_DIFF"))
 
-    @staticmethod
-    def get_slice_prefix(site_name, tile_type):
+    def handle_iserdes(self):
         """
-        Returns the slice prefix corresponding to the input site name.
-        """
-
-        slice_sites = {
-            "CLBLL_L": ["SLICEL_X0", "SLICEL_X1"],
-            "CLBLL_R": ["SLICEL_X0", "SLICEL_X1"],
-            "CLBLM_L": ["SLICEM_X0", "SLICEL_X1"],
-            "CLBLM_R": ["SLICEM_X0", "SLICEL_X1"],
-        }
-
-        slice_re = re.compile("SLICE_X([0-9]+)Y[0-9]+")
-        m = slice_re.match(site_name)
-        assert m, site_name
-
-        slice_site_idx = int(m.group(1)) % 2
-        return slice_sites[tile_type][slice_site_idx]
-
-    @staticmethod
-    def get_bram_prefix(site_name, tile_type):
-        """
-        Returns the slice prefix corresponding to the input site name.
+        Handles the ISERDES cell type features
         """
 
-        ramb_re = re.compile("RAMB18_X[0-9]+Y([0-9]+)")
-        m = ramb_re.match(site_name)
-        assert m, site_name
+        for cell_data in self.physical_cells_instances.values():
+            cell_type = cell_data.cell_type
+            if cell_type != "ISERDESE2":
+                continue
 
-        ramb_site_idx = int(m.group(1)) % 2
-        return "RAMB18_Y{}".format(ramb_site_idx)
+            tile_name = cell_data.tile_name
+            tile_type = cell_data.tile_type
+            site_name = cell_data.site_name
+            ilogic_prefix = self.get_iologic_prefix(site_name, tile_type)
+
+            attrs = cell_data.attributes
+
+            itype = attrs.get("INTERFACE_TYPE", "MEMORY")
+            width = attrs.get("DATA_WIDTH", "4")
+            data_rate = attrs.get("DATA_RATE", "DDR")
+            feature = "_".join([itype, data_rate, width])
+            print(tile_name, ilogic_prefix, feature, file=sys.stderr)
+
+            self.add_cell_feature((tile_name, ilogic_prefix, feature))
+
+            num_ce = attrs.get("NUM_CE", "2")
+            self.add_cell_feature((tile_name, ilogic_prefix,
+                                   "NUM_CE_N{}".format(num_ce)))
+
+            iob_delay = attrs.get("IOBDELAY", "NONE")
+
+            for idelay in ["IFD", "IBUF"]:
+                if iob_delay in [idelay, "BOTH"]:
+                    self.add_cell_feature((tile_name, ilogic_prefix,
+                                           "IOBDELAY_{}".format(idelay)))
+
+            for z_feature in ["INIT", "SRVAL"]:
+                for q in range(1, 5):
+                    z_attr = "{}_Q{}".format(z_feature, q)
+                    z_value = attrs.get(z_attr, 0)
+                    z_param = self.device_resources.get_parameter_definition(
+                        cell_type, z_attr)
+
+                    z_value = z_param.decode_integer(z_value)
+
+                    print(z_feature, q, z_value, file=sys.stderr)
+                    if z_value == 0:
+                        self.add_cell_feature((tile_name, ilogic_prefix,
+                                               "Z{}_{}".format(z_feature, q)))
 
     def add_lut_features(self):
         for lut in self.luts.values():
@@ -495,6 +566,24 @@ class XC7FasmGenerator(FasmGenerator):
             if not is_inverting:
                 zinv_feature = "ZINV_{}".format(pin)
                 self.add_cell_feature((tile_name, bram_prefix, zinv_feature))
+
+    def handle_ioi_routing_bels(self):
+        tile_types = [
+            "LIOI3", "LIOI3_SING", "LIOI3_TBYTETERM", "LIOI3_TBYTESRC",
+            "RIOI3", "RIOI3_SING", "RIOI3_TBYTETERM", "RIOI3_TBYTESRC"
+        ]
+        routing_bels = self.get_routing_bels(tile_types)
+
+        zinv_pins = ["C"]
+
+        for site, bel, pin, is_inverting in routing_bels:
+            tile_name, tile_type = self.get_tile_info_at_site(site)
+            iologic_prefix = self.get_iologic_prefix(site, tile_type)
+
+            if not is_inverting and pin in zinv_pins:
+                zinv_feature = "ZINV_{}".format(pin)
+                self.add_cell_feature((tile_name, iologic_prefix,
+                                       zinv_feature))
 
     def handle_slice_bel_pins(self):
         """
@@ -769,6 +858,7 @@ class XC7FasmGenerator(FasmGenerator):
         self.handle_brams()
         self.handle_clock_resources()
         self.handle_ios()
+        self.handle_iserdes()
         self.handle_luts()
         self.handle_slice_ff()
 
@@ -778,6 +868,7 @@ class XC7FasmGenerator(FasmGenerator):
         # Handling routing BELs
         self.handle_slice_routing_bels()
         self.handle_bram_routing_bels()
+        self.handle_ioi_routing_bels()
 
         # Handling bel pins
         self.handle_slice_bel_pins()
